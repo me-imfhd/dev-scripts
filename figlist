@@ -1,0 +1,71 @@
+#!/bin/bash
+
+dep_hint() {
+  case "$1" in
+    pdftotext|pdftoppm) echo "  sudo apt install poppler-utils   # Debian/Ubuntu"
+                        echo "  sudo dnf install poppler-utils   # Fedora"
+                        echo "  brew install poppler              # macOS" ;;
+    fzf)                echo "  sudo apt install fzf              # Debian/Ubuntu"
+                        echo "  brew install fzf                  # macOS"
+                        echo "  https://github.com/junegunn/fzf" ;;
+    chafa)              echo "  sudo apt install chafa            # Debian/Ubuntu"
+                        echo "  brew install chafa                # macOS"
+                        echo "  https://hpjansson.org/chafa/" ;;
+    zathura)            echo "  sudo apt install zathura          # Debian/Ubuntu"
+                        echo "  brew install zathura              # macOS (via homebrew-cask)" ;;
+  esac
+}
+
+require() {
+  if ! command -v "$1" &>/dev/null; then
+    echo "Error: '$1' not found."
+    dep_hint "$1"
+    exit 1
+  fi
+}
+
+if [[ $# -eq 0 ]]; then
+  echo "Usage: $0 <file.pdf> [pattern]"
+  exit 1
+fi
+
+pdf="$1"
+pattern="${2:-^Figure [0-9]+-[0-9]+.[[:space:]][[:alpha:]]}"
+
+if [[ ! -f "$pdf" ]]; then
+  echo "Error: file '$pdf' not found"
+  exit 1
+fi
+
+require pdftotext
+require pdftoppm
+require fzf
+require chafa
+# zathura: not checked — enter bind silently does nothing if absent
+
+pdftotext "$pdf" - \
+  | sed 's/\f/\n---PAGE---\n/g' \
+  | awk -v pat="$pattern" '
+      /^---PAGE---$/ { page++; next }
+      $0 ~ pat      { print page+1 "\t" $0 }
+    ' \
+  | fzf \
+      --no-sort \
+      --delimiter='\t' \
+      --with-nth=2 \
+      --preview='
+        pdf="'"$pdf"'"
+        page={1}
+        cols=$FZF_PREVIEW_COLUMNS
+        lines=$FZF_PREVIEW_LINES
+        pdf_name=$(basename "$pdf" .pdf)
+        mkdir -p /tmp/pdfpage
+        tmpimg=$(mktemp "/tmp/pdfpage/${pdf_name}_XXXX")
+        pdftoppm -f "$page" -l "$page" -rx 450 -ry 250 -cropbox -jpeg -singlefile "$pdf" "$tmpimg"
+        chafa -f sixels --size="${cols}x${lines}" "${tmpimg}.jpg"
+        rm -f "${tmpimg}.jpg" "$tmpimg"
+      ' \
+      --preview-window=right:70% \
+      --bind 'ctrl-r:change-preview-window(hidden|70%)' \
+      --bind 'enter:execute(zathura --page={1} "'"$pdf"'")' \
+      --bind 'ctrl-s:toggle-sort'
