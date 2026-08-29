@@ -4,12 +4,15 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/tmux-sessionizer"
 CONFIG_FILE="$CONFIG_DIR/$CONFIG_FILE_NAME"
 PANE_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/tmux-sessionizer"
 PANE_CACHE_FILE="$PANE_CACHE_DIR/panes.cache"
+SESSION_SUFFIX="-tmux-sessionizer"
 
 # config file example
 # ------------------------
 # # file: ~/.config/tmux-sessionizer/tmux-sessionizer.conf
 # # If set this override the default TS_SEARCH_PATHS (~/ ~/personal ~/personal/dev/env/.config)
-# TS_SEARCH_PATHS=(~/)
+TS_SEARCH_PATHS=(~/dev ~/.config)
+# Directories listed as-is (not their children)
+TS_DIRS=(~ ~/.local/bin ~/.pi/agent)
 # # If set this add additional search paths to the default TS_SEARCH_PATHS
 # # The number prefix is the depth for the Path [OPTIONAL]
 # TS_EXTRA_SEARCH_PATHS=(~/ghq:3 ~/Git:3 ~/.config:2)
@@ -222,13 +225,25 @@ fi
 
 # utility function to find directories
 find_dirs() {
-    # list TMUX sessions
+    # list TMUX sessions created by tmux-sessionizer, hide suffix in fzf
+    list_prjt_sessions() {
+        local current_session="$1"
+        tmux list-sessions -F "#{session_name}" 2>/dev/null | while read -r session_name; do
+            [[ "$session_name" == *"$SESSION_SUFFIX" ]] || continue
+            local display="${session_name%"$SESSION_SUFFIX"}"
+            [[ -n "$current_session" && "$session_name" == "$current_session" ]] && continue
+            echo "[TMUX] $display"
+        done
+    }
     if [[ -n "${TMUX}" ]]; then
-        current_session=$(tmux display-message -p '#S')
-        tmux list-sessions -F "[TMUX] #{session_name}" 2>/dev/null | grep -vFx "[TMUX] $current_session"
+        list_prjt_sessions "$(tmux display-message -p '#S')"
     else
-        tmux list-sessions -F "[TMUX] #{session_name}" 2>/dev/null
+        list_prjt_sessions ""
     fi
+
+    for dir in "${TS_DIRS[@]}"; do
+        [[ -d "$dir" ]] && echo "$dir"
+    done
 
     # note: TS_SEARCH_PATHS is an array of paths to search for directories
     # if the path ends with :number, it will search for directories with a max depth of number ;)
@@ -327,9 +342,10 @@ fi
 
 if [[ "$selected" =~ ^\[TMUX\]\ (.+)$ ]]; then
     selected="${BASH_REMATCH[1]}"
+    selected_name="${selected}${SESSION_SUFFIX}"
+else
+    selected_name="$(basename "$selected" | tr . _)${SESSION_SUFFIX}"
 fi
-
-selected_name=$(basename "$selected" | tr . _)
 
 if ! is_tmux_running; then
     tmux new-session -ds "$selected_name" -c "$selected"
