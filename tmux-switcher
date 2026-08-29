@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Toggle between a named tmux session (default: fx) and the previous session.
+# Optional second arg: client TTY (from WezTerm) so switch-client works
+# without $TMUX. Outside tmux with no TTY: attach.
+
+set -euo pipefail
+
+cmd="${1:-fx}"
+session="$(basename "$cmd")"
+client_tty="${2:-}"
+
+ensure_session() {
+    if tmux has-session -t "$session" 2>/dev/null; then
+        return
+    fi
+    tmux new-session -d -s "$session" -c "$HOME" "$cmd"
+}
+
+current=""
+if [[ -n "$client_tty" ]]; then
+    current="$(
+        tmux list-clients -F "#{client_tty} #{client_session}" 2>/dev/null |
+            awk -v t="$client_tty" '$1 == t { print $2; exit }'
+    )"
+elif [[ -n "${TMUX:-}" ]]; then
+    current="$(tmux display-message -p '#S')"
+else
+    ensure_session
+    exec tmux attach-session -t "$session"
+fi
+
+switch_to() {
+    local target="$1"
+    if [[ -n "$client_tty" ]]; then
+        tmux switch-client -c "$client_tty" -t "$target"
+    else
+        tmux switch-client -t "$target"
+    fi
+}
+
+if [[ -z "$current" ]]; then
+    exit 0
+fi
+
+if [[ "$current" == "$session" ]]; then
+    previous="$(tmux show-environment -g TMUX_SWITCHER_PREVIOUS 2>/dev/null |
+        sed 's/^TMUX_SWITCHER_PREVIOUS=//' || true)"
+    if [[ -n "$previous" ]] && tmux has-session -t "$previous" 2>/dev/null; then
+        switch_to "$previous"
+    fi
+    exit 0
+fi
+
+tmux set-environment -g TMUX_SWITCHER_PREVIOUS "$current"
+ensure_session
+switch_to "$session"
