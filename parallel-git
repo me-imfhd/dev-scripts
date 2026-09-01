@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+
+# Parallel Git
+# Pick a git branch in fzf, open it in its own worktree and tmux session.
+# closing that session stashes leftover changes and removes the worktree.
+
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+ROOT="/tmp/worktrees"
+SUFFIX="-tmux-sessionizer"
+# session-scoped session-closed hooks never fire (they die with the session),
+# so we use a global hook plus state files keyed by session name.
+STATE_DIR="$ROOT/.sessions"
+HOOK_INDEX=91
+
+# tmux session name for a worktree path
+session_name() {
+    local path="$1" rel
+    if [[ "$path" == "$GIT_MAIN" ]]; then
+        printf '%s%s' "$PROJECT" "$SUFFIX"
+    else
+        rel="${path#"$ROOT/${GIT_MAIN##*/}/"}"
+        printf 'worktree-%s-%s' "$PROJECT" "$rel"
+    fi
+}
+
+# where we stash path / home session / main repo for the close hook
+state_file() {
+    local sname="$1"
+    printf '%s/%s' "$STATE_DIR" "${sname//\//__}"
+}
+
+install_close_hook() {
+    tmux set-hook -g "session-closed[$HOOK_INDEX]" \
+        "run-shell -b '$SELF --on-hook \"#{hook_session_name}\"'"
+}
+
+# stash dirty files, drop the worktree, jump back to the main session
+on_session_closed() {
+    local path="${1:-}" sess="${2:-}" main="${3:-}"
+    if [[ -n "$path" && -d "$path" && "$path" != "$main" ]]; then
+        [[ -z "$(git -C "$path" status --porcelain 2>/dev/null)" ]] \
+            || git -C "$path" stash push -u -m "parallel-git" >/dev/null 2>&1 || true
+        git -C "${main:-$path}" worktree remove --force "$path" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$sess" ]]; then
+        tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -ds "$sess" -c "${main:-$HOME}"
+        tmux switch-client -t "$sess" 2>/dev/null || true
+    fi
+}
+
+# tmux calls these; not meant to be run by hand
+case "${1:-}" in
+    --on-session-closed)
+        on_session_closed "${2:-}" "${3:-}" "${4:-}"
+        exit 0
+        ;;
+    --on-hook)
+        sname="${2:-}"
+        sf="$(state_file "$sname")"
+        if [[ -n "$sname" && -f "$sf" ]]; then
+            mapfile -t _st < "$sf"
+            rm -f "$sf"
+            on_session_closed "${_st[0]:-}" "${_st[1]:-}" "${_st[2]:-}"
+        fi
+        exit 0
+        ;;
+esac
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+    echo "parallel-git: not a git repository" >&2
+    exit 1
+}
+
+GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir)"
+GIT_MAIN="${GIT_COMMON%/*}"
+CURRENT="$(git rev-parse --show-toplevel)"
+PROJECT="${GIT_MAIN##*/}"
+PROJECT="${PROJECT//./_}"
+HOME_SESS="${PROJECT}${SUFFIX}"
+
+declare -A WT=() HAS=() SEEN=()
+BRANCHES=()
+CUR=""
+
+# collect local + remote branches and any existing worktree paths
+while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    marker="${line:0:1}"
+    rest="${line:2}"
+    name="${rest%% *}"
+    [[ -n "$name" ]] || continue
+    if [[ "$name" == remotes/origin/* ]]; then
+        short="${name#remotes/origin/}"
+        [[ "$short" == HEAD ]] && continue
+        [[ -n "${SEEN[$short]:-}" ]] && continue
+        SEEN["$short"]=1
+        BRANCHES+=("$short")
+        continue
+    fi
+    [[ -n "${SEEN[$name]:-}" ]] || { SEEN["$name"]=1; BRANCHES+=("$name"); }
+    [[ "$rest" =~ \((/[^\)]+)\) ]] && WT["$name"]="${BASH_REMATCH[1]}"
+    [[ "$marker" == "*" ]] && CUR="$name"
+done < <(git branch -vva)
+
+while IFS= read -r s; do
+    [[ -n "$s" ]] && HAS["$s"]=1
+done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+
+# skip the branch we're already on; mark live tmux sessions and existing worktrees
+list=""
+for b in "${BRANCHES[@]}"; do
+    path="${WT[$b]:-}"
+    [[ "$b" == "$CUR" || "$path" == "$CURRENT" ]] && continue
+    [[ -n "$path" ]] || path="$ROOT/${GIT_MAIN##*/}/$b"
+    sname="$(session_name "$path")"
+    if [[ -n "${HAS[$sname]:-}" ]]; then
+        list+="[TMUX] $b"$'\n'
+    elif [[ -d "$path" ]]; then
+        list+="$path+"$'\n'
+    else
+        list+="$path"$'\n'
+    fi
+done
+
+selected="$(printf '%s' "$list" | fzf)" || true
+[[ -n "${selected:-}" ]] || exit 0
+
+if [[ "$selected" == "[TMUX] "* ]]; then
+    b="${selected#\[TMUX\] }"
+    path="${WT[$b]:-$ROOT/${GIT_MAIN##*/}/$b}"
+else
+    path="${selected%+}"
+    b="${path#"$ROOT/${GIT_MAIN##*/}/"}"
+fi
+
+# create the worktree if it doesn't exist yet
+if [[ "$path" != "$GIT_MAIN" && ! -d "$path" ]]; then
+    mkdir -p "$(dirname "$path")"
+    if git show-ref --verify --quiet "refs/heads/$b"; then
+        git worktree add "$path" "$b"
+    else
+        git worktree add -b "$b" "$path" "origin/$b"
+    fi
+fi
+
+# open or reuse a tmux session in that worktree
+sname="$(session_name "$path")"
+tmux has-session -t "=$sname" 2>/dev/null || tmux new-session -ds "$sname" -c "$path"
+# non-main sessions write state so the close hook can clean up
+if [[ "$path" != "$GIT_MAIN" ]]; then
+    tmux set-option -t "$sname" detach-on-destroy off
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$path" "$HOME_SESS" "$GIT_MAIN" > "$(state_file "$sname")"
+    install_close_hook
+fi
+
+if [[ -z "${TMUX:-}" ]]; then
+    tmux attach-session -t "$sname"
+else
+    tmux switch-client -t "$sname"
+fi
+
