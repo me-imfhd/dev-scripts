@@ -73,13 +73,27 @@ end
 local function launch_cmd(event, key, window_name, cmd)
 	wezterm.on(event, function(window, pane)
 		if pane_in_tmux(pane) then
-			wezterm.run_child_process({
-				"tmux",
-				"new-window",
-				"-n",
-				window_name,
-				cmd,
-			})
+			local args = { "tmux", "new-window", "-n", window_name }
+			local tty = pane_tty(pane)
+			if tty then
+				local ok, stdout = wezterm.run_child_process({
+					"tmux",
+					"display-message",
+					"-c",
+					tty,
+					"-p",
+					"#{pane_current_path}",
+				})
+				if ok and stdout then
+					local cwd = stdout:gsub("%s+$", "")
+					if cwd ~= "" then
+						table.insert(args, "-c")
+						table.insert(args, cwd)
+					end
+				end
+			end
+			table.insert(args, cmd)
+			wezterm.run_child_process(args)
 			return
 		end
 
@@ -99,6 +113,7 @@ local function launch_cmd(event, key, window_name, cmd)
 end
 
 launch_cmd("tmux-sessionizer", "f", "sessionizer", "tmux-sessionizer")
+launch_cmd("parallel-git", "m", "parallel-git", "parallel-git") -- cwd must be the git worktree
 
 local function tmux_cmd(name, mods, cmd, key)
 	wezterm.on(name, function(window, pane)
@@ -114,31 +129,37 @@ local function tmux_cmd(name, mods, cmd, key)
 	})
 end
 
-wezterm.on("fx-session-toggle", function(window, pane)
-	if pane_in_tmux(pane) then
-		local tty = pane_tty(pane)
-		if not tty then
+local function session_toggle(session, key)
+	local event = session .. "-session-toggle"
+	wezterm.on(event, function(window, pane)
+		if pane_in_tmux(pane) then
+			local tty = pane_tty(pane)
+			if not tty then
+				return
+			end
+			wezterm.run_child_process({
+				os.getenv("HOME") .. "/.local/bin/tmux-switcher",
+				session,
+				tty,
+			})
 			return
 		end
-		wezterm.run_child_process({
-			os.getenv("HOME") .. "/.local/bin/tmux-switcher",
-			"pi",
-			tty,
-		})
-		return
-	end
 
-	local name = proc_basename(pane:get_foreground_process_name())
-	if idle_shells[name] then
-		window:perform_action(wezterm.action.SendString("tmux-switcher pi\r"), pane)
-	end
-end)
+		local name = proc_basename(pane:get_foreground_process_name())
+		if idle_shells[name] then
+			window:perform_action(wezterm.action.SendString("tmux-switcher " .. session .. "\r"), pane)
+		end
+	end)
 
-table.insert(config.keys, {
-	key = ";",
-	mods = "ALT",
-	action = wezterm.action.EmitEvent("fx-session-toggle"),
-})
+	table.insert(config.keys, {
+		key = key,
+		mods = "ALT",
+		action = wezterm.action.EmitEvent(event),
+	})
+end
+
+session_toggle("pi", ";")
+session_toggle("cht", "c")
 
 tmux_cmd("next-window", "SUPER", { "tmux", "next-window" }, "k")
 tmux_cmd("prev-window", "SUPER", { "tmux", "previous-window" }, "j")
