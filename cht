@@ -1,0 +1,567 @@
+#!/usr/bin/env bash
+# Fuzzy-find through cheat.sh (https://cht.sh) layer by layer.
+#
+# Sheets and lists are cached under $XDG_CACHE_HOME/cht-fzf/tree as you
+# browse (lazy install). `cht --install [topic]` crawls and downloads
+# a subtree (or the whole tree) so later use is local.
+#
+#   cht                 browse from the root list
+#   cht awk             start inside awk
+#   cht --install awk   download the awk tree
+#   cht --offline       browse cache only
+
+set -uo pipefail
+
+CHTSH_URL="${CHTSH_URL:-https://cht.sh}"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/cht-fzf"
+TREE_DIR="${CHT_TREE:-$CACHE_DIR/tree}"
+# cht.sh serves HTML unless the UA looks like curl/wget/httpie.
+UA="curl/cht-fzf"
+JOBS="${CHT_JOBS:-6}"
+OFFLINE="${OFFLINE:-0}"
+YES=0
+
+mkdir -p "$TREE_DIR"
+
+usage() {
+  cat <<'EOF'
+Usage: cht [OPTIONS] [topic [subtopic ...]]
+
+Fuzzy-navigate cheat.sh. Select a topic, then drill into subtopics
+until you reach a cheat sheet. Topics ending with / have more pages.
+
+Sheets are cached lazily as you open them. Use --install to download
+a whole subtree (or the entire catalog) ahead of time.
+
+Options
+  --install [topic]  crawl and cache the tree (root if topic omitted)
+  --sync [topic]     alias for --install
+  --offline          never hit the network; use cache only
+  --jobs N           parallel fetches for --install (default 6)
+  -y, --yes          do not confirm a full-tree install
+  --stats            show cache size
+  --clear            delete the cached tree
+  -h, --help         this help
+
+Keys
+  enter     open a sheet, or drill into a folder (trailing /)
+  tab       use the typed query as the next segment (even if not listed)
+  ctrl-o    open the highlighted item (or typed query) as a sheet
+  ctrl-l    open the current path as a sheet
+  ctrl-p    toggle preview
+  ctrl-r    refresh this list from the network
+  esc       go back (quit at the root)
+
+Examples
+  cht
+  cht awk
+  cht --install python
+  cht --offline awk
+EOF
+}
+
+die() {
+  printf 'cht: %s\n' "$*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+need curl
+
+# Fast path for fzf preview: no function defs, no network.
+# Hovering/backspacing must not curl — that is what made the UI lag.
+if [[ "${1:-}" == --__preview ]]; then
+  cur="${2:-}"
+  item="${3:-}"
+  item="${item%/}"
+  [[ -z "$item" ]] && exit 0
+  if [[ -z "$cur" ]]; then
+    target="$item"
+  else
+    target="${cur}/${item}"
+  fi
+  sf="$TREE_DIR/${target}/.sheet"
+  if [[ -f "$sf" ]]; then
+    head -n 200 "$sf"
+  else
+    printf '(not cached — open once, or: cht --install %s)\n' "$target"
+  fi
+  exit 0
+fi
+
+# --- path helpers -------------------------------------------------------
+
+url_path() {
+  local p="$1"
+  p="${p// /+}"
+  printf '%s' "$p"
+}
+
+# Every topic is a directory: .list and .sheet live inside it.
+# Root list is $TREE_DIR/.list ; sheet for awk is $TREE_DIR/awk/.sheet
+tree_dir() {
+  local p="${1:-}"
+  if [[ -z "$p" ]]; then
+    printf '%s' "$TREE_DIR"
+  else
+    printf '%s/%s' "$TREE_DIR" "$p"
+  fi
+}
+
+list_file()  { printf '%s/.list'  "$(tree_dir "$1")"; }
+sheet_file() { printf '%s/.sheet' "$(tree_dir "$1")"; }
+
+safe_topic() {
+  local p="$1"
+  case "$p" in
+    *..*|~*|/*) die "invalid topic path: $p" ;;
+  esac
+}
+
+join_path() {
+  local base="$1" seg="$2"
+  seg="${seg%/}"
+  seg="${seg#/}"
+  [[ -z "$seg" ]] && { printf '%s' "$base"; return; }
+  if [[ -z "$base" ]]; then
+    printf '%s' "$seg"
+  else
+    printf '%s/%s' "$base" "$seg"
+  fi
+}
+
+parent_path() {
+  local p="$1"
+  if [[ "$p" == */* ]]; then
+    printf '%s' "${p%/*}"
+  else
+    printf ''
+  fi
+}
+
+normalize_query() {
+  local q="$1"
+  q="${q#"${q%%[![:space:]]*}"}"
+  q="${q%"${q##*[![:space:]]}"}"
+  q="${q// /+}"
+  printf '%s' "$q"
+}
+
+print_items() {
+  grep -v -e '^$' -e '^:list$' || true
+}
+
+# --- network / cache ----------------------------------------------------
+
+cht_curl() {
+  local loc="$1"
+  curl -fsS --compressed --max-time 20 -A "$UA" "${CHTSH_URL}/$(url_path "$loc")"
+}
+
+save_file() {
+  local dest="$1"
+  mkdir -p "$(dirname "$dest")"
+  local tmp="${dest}.$$"
+  cat >"$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$dest"
+}
+
+fetch_list() {
+  local path="${1:-}"
+  local refresh="${2:-0}"
+  local lf loc
+  lf="$(list_file "$path")"
+
+  if ((refresh == 0)) && [[ -f "$lf" ]]; then
+    cat "$lf"
+    return 0
+  fi
+
+  if ((OFFLINE)); then
+    if [[ -f "$lf" ]]; then
+      cat "$lf"
+      return 0
+    fi
+    return 1
+  fi
+
+  if [[ -z "$path" ]]; then
+    loc=":list"
+  else
+    loc="${path}/:list"
+  fi
+
+  if [[ -z "$path" && ! -f "$lf" ]]; then
+    printf 'cht: fetching topic list from %s ...\n' "$CHTSH_URL" >&2
+  fi
+
+  local body
+  if ! body=$(cht_curl "$loc"); then
+    if [[ -f "$lf" ]]; then
+      cat "$lf"
+      return 0
+    fi
+    return 1
+  fi
+  printf '%s\n' "$body" | sed '/^[[:space:]]*$/d' | save_file "$lf" || return 1
+  cat "$lf"
+}
+
+fetch_sheet() {
+  local path="$1"
+  local refresh="${2:-0}"
+  local sf
+  [[ -n "$path" ]] || return 1
+  sf="$(sheet_file "$path")"
+
+  if ((refresh == 0)) && [[ -f "$sf" ]]; then
+    cat "$sf"
+    return 0
+  fi
+
+  if ((OFFLINE)); then
+    if [[ -f "$sf" ]]; then
+      cat "$sf"
+      return 0
+    fi
+    return 1
+  fi
+
+  local body
+  if ! body=$(cht_curl "$path"); then
+    if [[ -f "$sf" ]]; then
+      cat "$sf"
+      return 0
+    fi
+    return 1
+  fi
+  printf '%s\n' "$body" | save_file "$sf" || return 1
+  cat "$sf"
+}
+
+has_subtopics() {
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == ":list" ]] && continue
+    return 0
+  done < <(fetch_list "$1" 0)
+  return 1
+}
+
+show_sheet() {
+  local path="$1"
+  [[ -n "$path" ]] || return
+  if [[ -f "$(sheet_file "$path")" ]]; then
+    printf 'cht: cache %s\n' "$path" >&2
+  else
+    printf 'cht: %s/%s\n' "$CHTSH_URL" "$path" >&2
+  fi
+  local body
+  if ! body=$(fetch_sheet "$path"); then
+    printf 'cht: no sheet for %s\n' "$path" >&2
+    return 1
+  fi
+  printf '%s\n' "$body" | less -R
+}
+
+# --- install / stats ----------------------------------------------------
+
+# Collect every sheet path under $1 into $2 (newline file). Recurses lists.
+collect_tree() {
+  local path="$1" out="$2"
+  local list items item next lf
+
+  list=$(fetch_list "$path" 1) || {
+    printf 'cht: skip %s (no list)\n' "${path:-/}" >&2
+    return 0
+  }
+  items=$(printf '%s\n' "$list" | print_items)
+  lf="$(list_file "$path")"
+  printf 'cht: list %s (%d entries)\n' "${path:-/}" "$(wc -l <"$lf")" >&2
+
+  if [[ -n "$path" ]]; then
+    printf '%s\n' "$path" >>"$out"
+  fi
+
+  if [[ -z "$items" ]]; then
+    return 0
+  fi
+
+  while IFS= read -r item || [[ -n "$item" ]]; do
+    [[ -z "$item" ]] && continue
+    next="$(join_path "$path" "$item")"
+    if [[ "$item" == */ ]]; then
+      collect_tree "$next" "$out"
+    else
+      printf '%s\n' "$next" >>"$out"
+    fi
+  done <<<"$items"
+}
+
+install_tree() {
+  local start="${1:-}"
+  local tmp total missed
+  need curl
+
+  if [[ -z "$start" && "$YES" -ne 1 ]]; then
+    printf 'Download the entire cheat.sh tree into %s?\n' "$TREE_DIR" >&2
+    printf 'Thousands of requests; can take a while. [y/N] ' >&2
+    local ans
+    read -r ans
+    case "$ans" in
+      y|Y|yes|YES) ;;
+      *) printf 'cht: aborted\n' >&2; return 1 ;;
+    esac
+  fi
+
+  tmp=$(mktemp "${TMPDIR:-/tmp}/cht-install.XXXXXX") || die "mktemp failed"
+  trap 'rm -f "$tmp"' RETURN
+
+  printf 'cht: crawling lists from %s%s\n' "$CHTSH_URL" "${start:+/$start}" >&2
+  collect_tree "$start" "$tmp"
+  sort -u "$tmp" -o "$tmp"
+  total=$(grep -c . "$tmp" || true)
+  printf 'cht: fetching %d sheets (%d jobs) into %s\n' "$total" "$JOBS" "$TREE_DIR" >&2
+
+  export CHTSH_URL UA TREE_DIR
+  # shellcheck disable=SC2016
+  missed=$(
+    xargs -a "$tmp" -d '\n' -P "$JOBS" -n 1 -r bash -c '
+      path="$1"
+      [[ -z "$path" ]] && exit 0
+      dest="$TREE_DIR/$path/.sheet"
+      mkdir -p "$(dirname "$dest")"
+      if [[ -f "$dest" ]]; then
+        exit 0
+      fi
+      if curl -fsS --compressed --max-time 20 -A "$UA" "${CHTSH_URL}/${path// /+}" >"${dest}.$$"; then
+        mv "${dest}.$$" "$dest"
+      else
+        rm -f "${dest}.$$"
+        printf "%s\n" "$path"
+        exit 0
+      fi
+    ' _
+  )
+
+  if [[ -n "$missed" ]]; then
+    printf 'cht: failed (%d):\n%s\n' "$(printf '%s\n' "$missed" | grep -c .)" "$missed" >&2
+  fi
+  printf 'cht: done. ' >&2
+  show_stats
+}
+
+show_stats() {
+  local lists sheets bytes
+  lists=$(find "$TREE_DIR" -type f -name '.list' 2>/dev/null | wc -l)
+  sheets=$(find "$TREE_DIR" -type f -name '.sheet' 2>/dev/null | wc -l)
+  bytes=$(du -sb "$TREE_DIR" 2>/dev/null | awk '{print $1}')
+  printf 'cache %s — %s lists, %s sheets, %s\n' \
+    "$TREE_DIR" "$lists" "$sheets" "$(numfmt --to=iec --suffix=B "$bytes" 2>/dev/null || echo "${bytes}B")"
+}
+
+clear_tree() {
+  if [[ "$YES" -ne 1 ]]; then
+    printf 'Delete cached tree at %s? [y/N] ' "$TREE_DIR" >&2
+    local ans
+    read -r ans
+    case "$ans" in
+      y|Y|yes|YES) ;;
+      *) printf 'cht: aborted\n' >&2; return 1 ;;
+    esac
+  fi
+  rm -rf "$TREE_DIR"
+  mkdir -p "$TREE_DIR"
+  printf 'cht: cache cleared\n' >&2
+}
+
+# --- args ---------------------------------------------------------------
+
+mode=browse
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --install|--sync)
+      mode=install
+      shift
+      ;;
+    --offline)
+      OFFLINE=1
+      shift
+      ;;
+    --jobs)
+      [[ $# -ge 2 ]] || die "--jobs needs a number"
+      JOBS="$2"
+      shift 2
+      ;;
+    --jobs=*)
+      JOBS="${1#--jobs=}"
+      shift
+      ;;
+    -y|--yes)
+      YES=1
+      shift
+      ;;
+    --stats)
+      mode=stats
+      shift
+      ;;
+    --clear)
+      mode=clear
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+path=""
+if [[ $# -gt 0 ]]; then
+  path=$(normalize_query "$(IFS=/; printf '%s' "$*")")
+  safe_topic "$path"
+fi
+
+case "$mode" in
+  stats)  show_stats; exit 0 ;;
+  clear)  clear_tree; exit 0 ;;
+  install)
+    install_tree "$path"
+    exit $?
+    ;;
+esac
+
+need fzf
+need less
+export OFFLINE TREE_DIR CHTSH_URL UA
+
+# --- browse -------------------------------------------------------------
+
+refresh=0
+
+while true; do
+  list=""
+  if ! list=$(fetch_list "$path" "$refresh"); then
+    if [[ -n "$path" ]]; then
+      show_sheet "$path" || true
+      path="$(parent_path "$path")"
+      refresh=0
+      continue
+    fi
+    die "failed to fetch ${CHTSH_URL}/:list (try without --offline?)"
+  fi
+  refresh=0
+
+  items=$(printf '%s\n' "$list" | print_items)
+
+  # No listed children → this is a leaf sheet.
+  if [[ -z "$items" ]]; then
+    if [[ -z "$path" ]]; then
+      die "empty topic list"
+    fi
+    show_sheet "$path" || true
+    path="$(parent_path "$path")"
+    continue
+  fi
+
+  prompt="cht.sh"
+  [[ -n "$path" ]] && prompt="cht.sh/${path}"
+  header="enter: open/drill  tab: typed query  ctrl-o: open  ctrl-l: this topic  ctrl-p: preview  ctrl-r: refresh  esc: back"
+  ((OFFLINE)) && header="OFFLINE  ${header}"
+
+  _cht_out=$(mktemp "${TMPDIR:-/tmp}/cht.XXXXXX") || die "mktemp failed"
+  printf '%s\n' "$items" | fzf \
+    --cycle \
+    --info=inline \
+    --prompt "${prompt}> " \
+    --header "$header" \
+    --print-query \
+    --expect=tab,ctrl-o,ctrl-l,ctrl-r,alt-enter \
+    --preview "$(printf '%q' "$0") --__preview $(printf '%q' "$path") {}" \
+    --preview-window 'right,60%,hidden,~2' \
+    --bind 'ctrl-p:toggle-preview' \
+    >"$_cht_out"
+  status=$?
+  mapfile -t out <"$_cht_out"
+  rm -f "$_cht_out"
+
+  if ((status == 130)); then
+    if [[ -z "$path" ]]; then
+      exit 0
+    fi
+    path="$(parent_path "$path")"
+    continue
+  fi
+  if ((status != 0)); then
+    exit 0
+  fi
+
+  query="$(normalize_query "${out[0]:-}")"
+  key="${out[1]:-}"
+  sel="${out[2]:-}"
+
+  case "$key" in
+    ctrl-r)
+      if ((OFFLINE)); then
+        printf 'cht: offline; cannot refresh\n' >&2
+      else
+        refresh=1
+      fi
+      continue
+      ;;
+    ctrl-l)
+      if [[ -n "$path" ]]; then
+        show_sheet "$path" || true
+      fi
+      continue
+      ;;
+    tab|alt-enter)
+      if [[ -z "$query" ]]; then
+        continue
+      fi
+      next="$(join_path "$path" "$query")"
+      if has_subtopics "$next"; then
+        path="$next"
+      else
+        show_sheet "$next" || true
+      fi
+      continue
+      ;;
+    ctrl-o)
+      target="$sel"
+      [[ -z "$target" ]] && target="$query"
+      [[ -z "$target" ]] && continue
+      show_sheet "$(join_path "$path" "$target")" || true
+      continue
+      ;;
+  esac
+
+  if [[ -z "$sel" ]]; then
+    if [[ -n "$query" ]]; then
+      next="$(join_path "$path" "$query")"
+      if has_subtopics "$next"; then
+        path="$next"
+      else
+        show_sheet "$next" || true
+      fi
+    fi
+    continue
+  fi
+
+  if [[ "$sel" == */ ]]; then
+    path="$(join_path "$path" "$sel")"
+    continue
+  fi
+
+  show_sheet "$(join_path "$path" "$sel")" || true
+done
