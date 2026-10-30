@@ -10,7 +10,7 @@ SESSION_SUFFIX="-tmux-sessionizer"
 # ------------------------
 # # file: ~/.config/tmux-sessionizer/tmux-sessionizer.conf
 # # If set this override the default TS_SEARCH_PATHS (~/ ~/personal ~/personal/dev/env/.config)
-TS_SEARCH_PATHS=(~/dev ~/.config)
+TS_SEARCH_PATHS=(~/dev ~/.config ~/wildcard ~/Personal ~/nisha_s)
 # Directories listed as-is (not their children)
 TS_DIRS=(~ ~/.local/bin ~/.pi/agent)
 # # If set this add additional search paths to the default TS_SEARCH_PATHS

@@ -2,12 +2,21 @@
 
 # Parallel Git
 # Pick a git branch in fzf, open it in its own worktree and tmux session.
-# closing that session stashes leftover changes and removes the worktree.
+# Closing that session stashes leftover changes and removes the worktree.
+#
+# macOS note: /bin/bash is 3.2, so this version avoids `readlink -f`,
+# `mapfile`, and associative arrays.
 
 set -euo pipefail
 
-SELF="$(readlink -f "$0")"
+SELF="${BASH_SOURCE[0]:-$0}"
+if [[ "$SELF" != /* ]]; then
+    SELF="$(cd "$(dirname "$SELF")" && pwd)/$(basename "$SELF")"
+fi
+
 ROOT="/tmp/worktrees"
+# Resolve /tmp -> /private/tmp on macOS so git's worktree paths match ours.
+ROOT="$(cd "$(dirname "$ROOT")" && pwd -P)/$(basename "$ROOT")"
 SUFFIX="-tmux-sessionizer"
 # session-scoped session-closed hooks never fire (they die with the session),
 # so we use a global hook plus state files keyed by session name.
@@ -16,13 +25,15 @@ HOOK_INDEX=91
 
 # tmux session name for a worktree path
 session_name() {
-    local path="$1" rel
+    local path="$1" rel name
     if [[ "$path" == "$GIT_MAIN" ]]; then
-        printf '%s%s' "$PROJECT" "$SUFFIX"
+        name="${PROJECT}${SUFFIX}"
     else
         rel="${path#"$ROOT/${GIT_MAIN##*/}/"}"
-        printf 'worktree-%s-%s' "$PROJECT" "$rel"
+        name="worktree-${PROJECT}-${rel}"
     fi
+    # tmux turns dots into underscores in session names
+    printf '%s' "${name//./_}"
 }
 
 # where we stash path / home session / main repo for the close hook
@@ -60,9 +71,16 @@ case "${1:-}" in
         sname="${2:-}"
         sf="$(state_file "$sname")"
         if [[ -n "$sname" && -f "$sf" ]]; then
-            mapfile -t _st < "$sf"
+            _st_path=""
+            _st_sess=""
+            _st_main=""
+            {
+                IFS= read -r _st_path || true
+                IFS= read -r _st_sess || true
+                IFS= read -r _st_main || true
+            } < "$sf"
             rm -f "$sf"
-            on_session_closed "${_st[0]:-}" "${_st[1]:-}" "${_st[2]:-}"
+            on_session_closed "$_st_path" "$_st_sess" "$_st_main"
         fi
         exit 0
         ;;
@@ -74,13 +92,37 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
 }
 
 GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir)"
-GIT_MAIN="${GIT_COMMON%/*}"
-CURRENT="$(git rev-parse --show-toplevel)"
+GIT_MAIN="$(cd "${GIT_COMMON%/*}" && pwd -P)"
+CURRENT="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
 PROJECT="${GIT_MAIN##*/}"
 PROJECT="${PROJECT//./_}"
 HOME_SESS="${PROJECT}${SUFFIX}"
 
-declare -A WT=() HAS=() SEEN=()
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/parallel-git.XXXXXX")"
+trap 'rm -rf "$TMP_DIR"' EXIT
+WT_FILE="$TMP_DIR/worktrees"
+HAS_FILE="$TMP_DIR/sessions"
+SEEN_FILE="$TMP_DIR/seen"
+: > "$WT_FILE"
+: > "$HAS_FILE"
+: > "$SEEN_FILE"
+
+seen_has() {
+    grep -Fxq -e "$1" "$SEEN_FILE"
+}
+
+seen_add() {
+    printf '%s\n' "$1" >> "$SEEN_FILE"
+}
+
+wt_path() {
+    awk -F '\t' -v b="$1" '$1 == b { print $2; exit }' "$WT_FILE"
+}
+
+has_session() {
+    grep -Fxq -e "$1" "$HAS_FILE"
+}
+
 BRANCHES=()
 CUR=""
 
@@ -94,28 +136,32 @@ while IFS= read -r line; do
     if [[ "$name" == remotes/origin/* ]]; then
         short="${name#remotes/origin/}"
         [[ "$short" == HEAD ]] && continue
-        [[ -n "${SEEN[$short]:-}" ]] && continue
-        SEEN["$short"]=1
-        BRANCHES+=("$short")
+        if ! seen_has "$short"; then
+            seen_add "$short"
+            BRANCHES+=("$short")
+        fi
         continue
     fi
-    [[ -n "${SEEN[$name]:-}" ]] || { SEEN["$name"]=1; BRANCHES+=("$name"); }
-    [[ "$rest" =~ \((/[^\)]+)\) ]] && WT["$name"]="${BASH_REMATCH[1]}"
+    if ! seen_has "$name"; then
+        seen_add "$name"
+        BRANCHES+=("$name")
+    fi
+    [[ "$rest" =~ \((/[^\)]+)\) ]] && printf '%s\t%s\n' "$name" "${BASH_REMATCH[1]}" >> "$WT_FILE"
     [[ "$marker" == "*" ]] && CUR="$name"
 done < <(git branch -vva)
 
 while IFS= read -r s; do
-    [[ -n "$s" ]] && HAS["$s"]=1
+    [[ -n "$s" ]] && printf '%s\n' "$s" >> "$HAS_FILE"
 done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
 
 # skip the branch we're already on; mark live tmux sessions and existing worktrees
 list=""
 for b in "${BRANCHES[@]}"; do
-    path="${WT[$b]:-}"
+    path="$(wt_path "$b")"
     [[ "$b" == "$CUR" || "$path" == "$CURRENT" ]] && continue
     [[ -n "$path" ]] || path="$ROOT/${GIT_MAIN##*/}/$b"
     sname="$(session_name "$path")"
-    if [[ -n "${HAS[$sname]:-}" ]]; then
+    if has_session "$sname"; then
         list+="[TMUX] $b"$'\n'
     elif [[ -d "$path" ]]; then
         list+="$path+"$'\n'
@@ -129,7 +175,8 @@ selected="$(printf '%s' "$list" | fzf)" || true
 
 if [[ "$selected" == "[TMUX] "* ]]; then
     b="${selected#\[TMUX\] }"
-    path="${WT[$b]:-$ROOT/${GIT_MAIN##*/}/$b}"
+    path="$(wt_path "$b")"
+    [[ -n "$path" ]] || path="$ROOT/${GIT_MAIN##*/}/$b"
 else
     path="${selected%+}"
     b="${path#"$ROOT/${GIT_MAIN##*/}/"}"
@@ -161,4 +208,3 @@ if [[ -z "${TMUX:-}" ]]; then
 else
     tmux switch-client -t "$sname"
 fi
-
