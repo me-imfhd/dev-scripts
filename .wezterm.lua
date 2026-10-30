@@ -53,7 +53,7 @@ config.color_scheme = "Gruvbox Dark (Gogh)"
 
 table.insert(config.keys, {
     key = "a",
-    mods = "SUPER",
+    mods = "ALT",
     action = wezterm.action.SendKey({ key = "a", mods = "CTRL" }),
 })
 
