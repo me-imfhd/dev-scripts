@@ -5,6 +5,8 @@ Layout mirrors `$HOME`:
 
 - `.local/bin/` — scripts installed on `PATH`
 - `.config/tmux/tmux.conf` — tmux config
-- `.zshrc`, `.wezterm.lua` — home dotfiles
+- `.zshrc` — home dotfile
+- `.wezterm.lua` — macOS WezTerm config
+- `.wezterm.linux.lua` — Linux WezTerm config
 
 `PATH` prints the current `$PATH`, one entry per line.

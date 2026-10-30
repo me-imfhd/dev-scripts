@@ -1,3 +1,6 @@
+-- macOS WezTerm configuration.
+-- Linux version: .wezterm.linux.lua
+
 -- Pull in the wezterm API
 local wezterm = require("wezterm")
 
