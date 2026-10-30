@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+
+# Some launchers/tmux servers can provide a relative HOME; make it absolute
+# so every `~` expansion below resolves to a real path.
+if [[ -n "$HOME" && "$HOME" != /* ]]; then
+    HOME="/$HOME"
+    export HOME
+fi
+
 CONFIG_FILE_NAME="tmux-sessionizer.conf"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/tmux-sessionizer"
 CONFIG_FILE="$CONFIG_DIR/$CONFIG_FILE_NAME"

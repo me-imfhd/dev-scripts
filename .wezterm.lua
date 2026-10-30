@@ -7,6 +7,7 @@ local wezterm = require("wezterm")
 -- This will hold the configuration.
 local config = wezterm.config_builder()
 
+
 -- This is where you actually apply your config choices.
 config.keys = {}
 
@@ -14,7 +15,10 @@ config.keys = {}
 -- ~/.zshrc, so Homebrew / user binaries are not on PATH for run_child_process.
 -- Resolve the tools used below explicitly instead of relying on PATH.
 local function find_program(name)
-    local home = os.getenv("HOME") or ""
+    local home = wezterm.home_dir or os.getenv("HOME") or ""
+    if home ~= "" and home:sub(1, 1) ~= "/" then
+        home = "/" .. home
+    end
     local candidates = {
         home .. "/.local/bin/" .. name,
         "/opt/homebrew/bin/" .. name,
@@ -30,6 +34,13 @@ local function find_program(name)
         end
     end
     return name -- fall back to PATH lookup
+end
+
+local function absolute(path)
+    if path and path ~= "" and path:sub(1, 1) ~= "/" then
+        return "/" .. path
+    end
+    return path
 end
 
 local tmux = find_program("tmux")
@@ -115,6 +126,7 @@ end
 -- idle shell outside tmux -> run here
 -- other process outside tmux -> do nothing
 local function launch_cmd(event, key, window_name, cmd)
+    cmd = absolute(cmd)
     wezterm.on(event, function(window, pane)
         if pane_in_tmux(pane) then
             local args = { tmux, "new-window", "-n", window_name }
@@ -129,7 +141,7 @@ local function launch_cmd(event, key, window_name, cmd)
                     "#{pane_current_path}",
                 })
                 if stdout then
-                    local cwd = stdout:gsub("%s+$", "")
+                    local cwd = absolute(stdout:gsub("%s+$", ""))
                     if cwd ~= "" then
                         table.insert(args, "-c")
                         table.insert(args, cwd)
