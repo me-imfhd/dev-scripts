@@ -1,5 +1,4 @@
--- macOS WezTerm configuration.
--- Linux version: .wezterm.linux.lua
+-- WezTerm configuration for macOS and Linux.
 
 -- Pull in the wezterm API
 local wezterm = require("wezterm")
@@ -21,11 +20,13 @@ local function find_program(name)
     end
     local candidates = {
         home .. "/.local/bin/" .. name,
-        "/opt/homebrew/bin/" .. name,
         "/usr/local/bin/" .. name,
         "/usr/bin/" .. name,
         "/bin/" .. name,
     }
+    if wezterm.target_triple:find("darwin") then
+        table.insert(candidates, 2, "/opt/homebrew/bin/" .. name)
+    end
     for _, path in ipairs(candidates) do
         local handle = io.open(path, "r")
         if handle then
@@ -46,6 +47,12 @@ end
 local tmux = find_program("tmux")
 local tmux_sessionizer = find_program("tmux-sessionizer")
 local parallel_git = find_program("parallel-git")
+local tmux_switcher = find_program("tmux-switcher")
+local home = wezterm.home_dir or os.getenv("HOME") or ""
+local tool_path = (os.getenv("PATH") or "/usr/bin:/bin") .. ":" .. home .. "/.local/bin:/usr/local/bin:/usr/bin:/bin"
+if wezterm.target_triple:find("darwin") then
+    tool_path = tool_path .. ":/opt/homebrew/bin"
+end
 
 -- run_child_process raises when the binary cannot be spawned. Return nil
 -- instead, so a failed spawn cannot abort the whole key handler.
@@ -148,6 +155,14 @@ local function launch_cmd(event, key, window_name, cmd)
                     end
                 end
             end
+            -- Provide tool locations and run via a lightweight shell.
+            table.insert(args, "/usr/bin/env")
+            table.insert(args, "PATH=" .. tool_path)
+            table.insert(args, "/bin/bash")
+            table.insert(args, "-c")
+            -- Keep the window open on error so the diagnostic is readable.
+            table.insert(args, '"$@"; rc=$?; if [ "$rc" -ne 0 ]; then printf "\\nCommand failed (exit %s). Press Enter to close.\\n" "$rc"; read -r; fi; exit "$rc"')
+            table.insert(args, "--")
             table.insert(args, cmd)
             run_child_process(args)
             return
@@ -194,8 +209,10 @@ local function session_toggle(session, key)
             if not tty then
                 return
             end
-            wezterm.run_child_process({
-                os.getenv("HOME") .. "/.local/bin/tmux-switcher",
+            run_child_process({
+                "/usr/bin/env",
+                "PATH=" .. tool_path,
+                tmux_switcher,
                 session,
                 tty,
             })

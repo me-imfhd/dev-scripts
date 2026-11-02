@@ -13,7 +13,8 @@ ensure_session() {
     if tmux has-session -t "$session" 2>/dev/null; then
         return
     fi
-    tmux new-session -d -s "$session" -c "$HOME" "$cmd"
+    # Pass the launcher's PATH explicitly; the tmux server may have an older one.
+    tmux new-session -d -s "$session" -c "$HOME" /usr/bin/env "PATH=$PATH" "$cmd"
 }
 
 current=""
